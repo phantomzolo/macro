@@ -1,0 +1,778 @@
+-- Macro System v1.0 (Standalone)
+-- Records Place/Upgrade/Sell, saves/loads JSON, playback with delays, UI included.
+-- Author: ChatGPT (adapted for Roblox)
+
+repeat task.wait() until game:IsLoaded()
+
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+local RS = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+-- Config / Paths
+local MACRO_FOLDER = "Macros"
+local function ensureFolder()
+    if isfolder and not isfolder(MACRO_FOLDER) then
+        pcall(function() makefolder(MACRO_FOLDER) end)
+    end
+end
+ensureFolder()
+
+-- Globals
+getgenv().Macros = getgenv().Macros or {}           -- name -> table (macro steps)
+getgenv().CurrentMacro = getgenv().CurrentMacro or nil
+getgenv().MacroRecording = false
+getgenv().MacroData = {}
+getgenv().MacroStartTime = 0
+getgenv().MacroPlaybackActive = false
+getgenv().MacroStepDelay = tonumber(getgenv().MacroStepDelay) or 0.15
+getgenv().MacroRemoteCache = getgenv().MacroRemoteCache or {}
+
+-- Utilities
+local function safeWriteFile(path, content)
+    if writefile then
+        local ok, err = pcall(function() writefile(path, content) end)
+        return ok, err
+    else
+        return false, "writefile not available"
+    end
+end
+
+local function safeReadFile(path)
+    if readfile then
+        local ok, content = pcall(function() return readfile(path) end)
+        if ok then return content end
+    end
+    return nil
+end
+
+local function jsonEncode(t) return HttpService:JSONEncode(t) end
+local function jsonDecode(s) 
+    local ok, res = pcall(function() return HttpService:JSONDecode(s) end)
+    if ok then return res end
+    return nil
+end
+
+-- Remote caching (populate common remotes)
+local function cacheRemotes()
+    pcall(function()
+        for _, v in pairs(RS:GetDescendants()) do
+            if v:IsA("RemoteEvent") or v:IsA("RemoteFunction") then
+                getgenv().MacroRemoteCache[v.Name:lower()] = v
+            end
+        end
+    end)
+end
+cacheRemotes()
+
+-- Save/Load
+local function saveMacro(name, data)
+    if not name then return false, "No name" end
+    getgenv().Macros[name] = data or {}
+    ensureFolder()
+    local path = MACRO_FOLDER.."/"..name..".json"
+    local ok, err = safeWriteFile(path, jsonEncode(data or {}))
+    return ok, err
+end
+
+local function loadMacrosFromDisk()
+    ensureFolder()
+    if listfiles then
+        for _, f in pairs(listfiles(MACRO_FOLDER)) do
+            if f:sub(-5):lower() == ".json" then
+                local base = f:match("([^/\\]+)%.json$")
+                local content = safeReadFile(f)
+                if content then
+                    local tbl = jsonDecode(content)
+                    if type(tbl) == "table" then
+                        getgenv().Macros[base] = tbl
+                    end
+                end
+            end
+        end
+    else
+        -- fallback: nothing to load if listfiles not available
+    end
+end
+loadMacrosFromDisk()
+
+-- Macro step format:
+-- {
+--   RemoteName = "PlaceTower" / "Upgrade" / "Sell" / fallback,
+--   Args = {...},            -- arguments for remote
+--   Time = number (s since recording start),
+--   ActionType = "Place"/"Upgrade"/"Sell",
+--   TowerName = string?,
+--   Cost = number?,
+--   Wave = number?
+-- }
+
+-- Recording: try to hook remote sends (hookmetamethod), else fallback to workspace tracking
+local hookNamecall = nil
+local enabledHook = false
+
+-- Tower tracker fallback
+local towerTracker = {
+    placeCounts = {},     -- name -> count
+    upgradeLevels = {},   -- instance -> level
+}
+
+local function getPlaceCostMock(towerName) -- simple fallback (zero)
+    return 0
+end
+
+local function startRecording()
+    if getgenv().MacroRecording then return end
+    getgenv().MacroRecording = true
+    getgenv().MacroData = {}
+    getgenv().MacroStartTime = tick()
+    print("[Macro] Recording started")
+end
+
+local function stopRecording(saveName)
+    if not getgenv().MacroRecording then return end
+    getgenv().MacroRecording = false
+    local recorded = getgenv().MacroData or {}
+    print("[Macro] Recording stopped, steps:", #recorded)
+    if saveName and saveName ~= "" then
+        local ok, err = saveMacro(saveName, recorded)
+        if ok then
+            print("[Macro] Saved as:", saveName)
+        else
+            warn("[Macro] Save failed:", err)
+        end
+    end
+end
+
+-- Workspace monitoring fallback to detect new towers/places/upgrade/sell
+local function scanTowersForChanges()
+    -- initialize counts
+    local counts = {}
+    for _, tower in pairs(workspace:FindFirstChild("Towers") and workspace.Towers:GetChildren() or {}) do
+        local owner = tower:FindFirstChild("Owner")
+        if owner and owner.Value == LocalPlayer then
+            counts[tower.Name] = (counts[tower.Name] or 0) + 1
+        end
+    end
+    towerTracker.placeCounts = counts
+end
+scanTowersForChanges()
+
+-- Hook namecall (best effort) to capture common remote usage
+local namecallHooked = false
+local mt = getrawmetatable and getrawmetatable(game) or nil
+local oldNamecall = nil
+
+local function setupNamecallHook()
+    if namecallHooked then return end
+    if not getrawmetatable or not setreadonly then
+        return
+    end
+    local ok, err = pcall(function()
+        mt = getrawmetatable(game)
+        oldNamecall = mt.__namecall
+        setreadonly(mt, false)
+        mt.__namecall = newcclosure(function(self, ...)
+            local method = getnamecallmethod and getnamecallmethod() or ""
+            local args = {...}
+            local lowerName = ""
+            if typeof(self) == "Instance" and (self.Name) then
+                lowerName = tostring(self.Name):lower()
+            end
+
+            -- if recording, capture certain remotes
+            if getgenv().MacroRecording then
+                local now = tick()
+                local timeSince = now - getgenv().MacroStartTime
+                local lower = lowerName
+                local actionType = nil
+                if lower:find("place") or lower:find("tower") then
+                    actionType = "Place"
+                elseif lower:find("upgrade") then
+                    actionType = "Upgrade"
+                elseif lower:find("sell") then
+                    actionType = "Sell"
+                end
+
+                if actionType then
+                    local step = {
+                        RemoteName = lowerName,
+                        Args = args,
+                        Time = timeSince,
+                        IsInvoke = (method == "InvokeServer" or method == "Invoke"),
+                        ActionType = actionType,
+                        TowerName = (args[1] and type(args[1]) == "string" and args[1]) or nil,
+                        Cost = 0,
+                        Wave = (RS:FindFirstChild("Wave") and RS.Wave.Value) or 0
+                    }
+                    table.insert(getgenv().MacroData, step)
+                end
+            end
+
+            return oldNamecall(self, ...)
+        end)
+        setreadonly(mt, true)
+        namecallHooked = true
+        print("[Macro] namecall hook installed")
+    end)
+    if not ok then
+        namecallHooked = false
+        -- not critical; fallback will handle
+    end
+end
+
+setupNamecallHook()
+
+-- Robust fallback: monitor Towers folder for new instances and property changes
+local towerConnections = {}
+
+local function watchTower(tower)
+    if towerConnections[tower] then return end
+    towerConnections[tower] = {}
+    -- Owner change isn't common; we watch Upgrade property
+    local upgrade = tower:FindFirstChild("Upgrade")
+    if upgrade and upgrade:GetAttribute("__hooked") ~= true then
+        local conn
+        conn = upgrade:GetPropertyChangedSignal("Value"):Connect(function()
+            if not getgenv().MacroRecording then return end
+            local now = tick()
+            local timeSince = now - getgenv().MacroStartTime
+            local towerName = tower.Name
+            local step = {
+                RemoteName = "Upgrade",
+                Args = {},
+                Time = timeSince,
+                IsInvoke = false,
+                ActionType = "Upgrade",
+                TowerName = towerName,
+                Cost = 0,
+                Wave = (RS:FindFirstChild("Wave") and RS.Wave.Value) or 0
+            }
+            table.insert(getgenv().MacroData, step)
+        end)
+        towerConnections[tower].upgradeConn = conn
+    end
+end
+
+local function unwatchAllTowers()
+    for t, conns in pairs(towerConnections) do
+        for _, c in pairs(conns) do
+            pcall(function() c:Disconnect() end)
+        end
+    end
+    towerConnections = {}
+end
+
+-- Scan loop to detect placements / sells by tracking counts
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        if getgenv().MacroRecording then
+            pcall(function()
+                local towersFolder = workspace:FindFirstChild("Towers")
+                if not towersFolder then return end
+                local currentCounts = {}
+                for _, tower in pairs(towersFolder:GetChildren()) do
+                    local owner = tower:FindFirstChild("Owner")
+                    if owner and owner.Value == LocalPlayer then
+                        local name = tower.Name
+                        currentCounts[name] = (currentCounts[name] or 0) + 1
+                    end
+                end
+
+                -- detect new placements
+                for name, count in pairs(currentCounts) do
+                    local last = towerTracker.placeCounts[name] or 0
+                    if count > last then
+                        -- recorded places (one or more)
+                        local now = tick()
+                        local timeSince = now - getgenv().MacroStartTime
+                        for i = 1, (count - last) do
+                            local step = {
+                                RemoteName = "PlaceTower",
+                                Args = {name},
+                                Time = timeSince,
+                                IsInvoke = false,
+                                ActionType = "Place",
+                                TowerName = name,
+                                Cost = getPlaceCostMock(name),
+                                Wave = (RS:FindFirstChild("Wave") and RS.Wave.Value) or 0
+                            }
+                            table.insert(getgenv().MacroData, step)
+                        end
+                    end
+                end
+
+                -- detect sells (counts decreased)
+                for name, last in pairs(towerTracker.placeCounts) do
+                    local nowCount = currentCounts[name] or 0
+                    if nowCount < last then
+                        local sold = last - nowCount
+                        local now = tick()
+                        local timeSince = now - getgenv().MacroStartTime
+                        for i = 1, sold do
+                            local step = {
+                                RemoteName = "Sell",
+                                Args = {name},
+                                Time = timeSince,
+                                IsInvoke = false,
+                                ActionType = "Sell",
+                                TowerName = name,
+                                Cost = 0,
+                                Wave = (RS:FindFirstChild("Wave") and RS.Wave.Value) or 0
+                            }
+                            table.insert(getgenv().MacroData, step)
+                        end
+                    end
+                end
+
+                towerTracker.placeCounts = currentCounts
+            end)
+        else
+            -- when not recording keep tracker in sync
+            pcall(function()
+                local towersFolder = workspace:FindFirstChild("Towers")
+                if not towersFolder then towerTracker.placeCounts = {} else
+                    local c = {}
+                    for _, tower in pairs(towersFolder:GetChildren()) do
+                        local owner = tower:FindFirstChild("Owner")
+                        if owner and owner.Value == LocalPlayer then
+                            c[tower.Name] = (c[tower.Name] or 0) + 1
+                        end
+                    end
+                    towerTracker.placeCounts = c
+                end
+            end)
+        end
+    end
+end)
+
+-- Playback
+local function findRemoteForAction(actionName)
+    cacheRemotes()
+    if not actionName then return nil end
+    local lower = actionName:lower()
+    if getgenv().MacroRemoteCache[lower] then return getgenv().MacroRemoteCache[lower] end
+    -- fallback: find any remote with 'place' or 'upgrade' in name
+    for name, rem in pairs(getgenv().MacroRemoteCache) do
+        if lower:find("place") and name:find("place") then return rem end
+        if lower:find("upgrade") and name:find("upgrade") then return rem end
+        if lower:find("sell") and name:find("sell") then return rem end
+    end
+    return nil
+end
+
+local function executeAction(action)
+    if not action or not action.RemoteName then return false, "No remote" end
+    local remote = findRemoteForAction(action.RemoteName)
+    if not remote then return false, "Remote not found: "..tostring(action.RemoteName) end
+    local ok, res
+    if remote:IsA("RemoteFunction") then
+        ok, res = pcall(function() return remote:InvokeServer(unpack(action.Args or {})) end)
+    else
+        ok, res = pcall(function() return remote:FireServer(unpack(action.Args or {})) end)
+    end
+    return ok, res
+end
+
+local function validateMacro(macro)
+    if not macro or #macro == 0 then return false, "Macro empty" end
+    local hasPlace = false
+    for _, step in ipairs(macro) do
+        if not step.ActionType or not step.RemoteName then
+            return false, "Invalid step"
+        end
+        if step.ActionType == "Place" then hasPlace = true end
+    end
+    if not hasPlace then return false, "No place actions in macro" end
+    return true, "OK"
+end
+
+local function playMacro(name)
+    if getgenv().MacroPlaybackActive then return false, "Playback already active" end
+    local macro = getgenv().Macros[name]
+    if not macro then return false, "Macro not found" end
+    local valid, msg = validateMacro(macro)
+    if not valid then return false, msg end
+
+    getgenv().MacroPlaybackActive = true
+    task.spawn(function()
+        print("[Macro] Starting playback:", name, "#steps:", #macro)
+        local step = 1
+        while getgenv().MacroPlaybackActive and step <= #macro do
+            local a = macro[step]
+            getgenv().MacroCurrentStep = step
+            -- attempt action
+            local ok, res = executeAction(a)
+            if ok then
+                -- success
+            else
+                -- on failure we retry once
+                warn("[Macro] step failed:", tostring(res), "retrying...")
+                task.wait(0.25)
+                ok, res = executeAction(a)
+                if not ok then
+                    warn("[Macro] step failed after retry:", tostring(res))
+                end
+            end
+
+            step = step + 1
+            local delay = tonumber(getgenv().MacroStepDelay) or 0.15
+            task.wait(delay)
+        end
+
+        getgenv().MacroPlaybackActive = false
+        print("[Macro] Playback finished:", name)
+    end)
+    return true
+end
+
+local function stopPlayback()
+    getgenv().MacroPlaybackActive = false
+end
+
+-- UI: Simple ScreenGui with macro list, create, record, play, save, import
+local StarterGui = game:GetService("StarterGui")
+local CoreGui = game:GetService("CoreGui")
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "MacroSystemGui"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.Parent = (gethui and gethui()) or CoreGui
+
+-- Basic window
+local frame = Instance.new("Frame")
+frame.Size = UDim2.new(0, 520, 0, 360)
+frame.Position = UDim2.new(0, 30, 0, 60)
+frame.BackgroundColor3 = Color3.fromRGB(28,28,30)
+frame.BorderSizePixel = 0
+frame.AnchorPoint = Vector2.new(0,0)
+frame.Parent = gui
+frame.Active = true
+frame.Draggable = true
+
+local title = Instance.new("TextLabel", frame)
+title.Size = UDim2.new(1, -20, 0, 36)
+title.Position = UDim2.new(0, 10, 0, 6)
+title.BackgroundTransparency = 1
+title.Text = "Macro System"
+title.TextSize = 20
+title.Font = Enum.Font.SourceSansBold
+title.TextColor3 = Color3.fromRGB(235,235,235)
+title.TextXAlignment = Enum.TextXAlignment.Left
+
+-- Left column: macro list & controls
+local left = Instance.new("Frame", frame)
+left.Size = UDim2.new(0, 240, 1, -20)
+left.Position = UDim2.new(0, 10, 0, 50)
+left.BackgroundTransparency = 1
+
+local listLabel = Instance.new("TextLabel", left)
+listLabel.Size = UDim2.new(1, 0, 0, 20)
+listLabel.Position = UDim2.new(0, 0, 0, 0)
+listLabel.BackgroundTransparency = 1
+listLabel.Text = "Macros"
+listLabel.TextColor3 = Color3.fromRGB(220,220,220)
+listLabel.Font = Enum.Font.SourceSansSemibold
+listLabel.TextSize = 14
+listLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local macroList = Instance.new("ScrollingFrame", left)
+macroList.Size = UDim2.new(1, 0, 1, -100)
+macroList.Position = UDim2.new(0, 0, 0, 24)
+macroList.BackgroundTransparency = 1
+macroList.CanvasSize = UDim2.new(0,0)
+macroList.ScrollBarThickness = 6
+
+local uiListLayout = Instance.new("UIListLayout", macroList)
+uiListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+uiListLayout.Padding = UDim.new(0, 6)
+
+local function refreshMacroList()
+    for _, child in pairs(macroList:GetChildren()) do
+        if child:IsA("TextButton") then child:Destroy() end
+    end
+    local names = {}
+    for name in pairs(getgenv().Macros) do table.insert(names, name) end
+    table.sort(names)
+    for i, name in ipairs(names) do
+        local btn = Instance.new("TextButton", macroList)
+        btn.Size = UDim2.new(1, -8, 0, 28)
+        btn.BackgroundColor3 = Color3.fromRGB(40,40,44)
+        btn.BorderSizePixel = 0
+        btn.TextColor3 = Color3.fromRGB(230,230,230)
+        btn.Font = Enum.Font.SourceSans
+        btn.TextSize = 14
+        btn.Text = name
+        btn.LayoutOrder = i
+        btn.MouseButton1Click:Connect(function()
+            getgenv().CurrentMacro = name
+            print("[Macro] Selected:", name)
+            -- visual highlight
+            for _,c in pairs(macroList:GetChildren()) do if c:IsA("TextButton") then c.BackgroundColor3 = Color3.fromRGB(40,40,44) end end
+            btn.BackgroundColor3 = Color3.fromRGB(60,60,64)
+        end)
+    end
+    macroList.CanvasSize = UDim2.new(0, 0, 0, uiListLayout.AbsoluteContentSize.Y + 8)
+end
+refreshMacroList()
+
+-- Right column: controls
+local right = Instance.new("Frame", frame)
+right.Size = UDim2.new(0, 250, 1, -20)
+right.Position = UDim2.new(0, 260, 0, 50)
+right.BackgroundTransparency = 1
+
+local createLabel = Instance.new("TextLabel", right)
+createLabel.Size = UDim2.new(1, 0, 0, 18)
+createLabel.Position = UDim2.new(0, 0, 0, 0)
+createLabel.BackgroundTransparency = 1
+createLabel.Text = "Create / Import / Controls"
+createLabel.TextColor3 = Color3.fromRGB(220,220,220)
+createLabel.Font = Enum.Font.SourceSansSemibold
+createLabel.TextSize = 14
+createLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local nameInput = Instance.new("TextBox", right)
+nameInput.Size = UDim2.new(1, -80, 0, 26)
+nameInput.Position = UDim2.new(0, 0, 0, 26)
+nameInput.BackgroundColor3 = Color3.fromRGB(36,36,38)
+nameInput.TextColor3 = Color3.fromRGB(220,220,220)
+nameInput.PlaceholderText = "Macro name..."
+nameInput.BorderSizePixel = 0
+nameInput.Font = Enum.Font.SourceSans
+nameInput.TextSize = 14
+
+local createBtn = Instance.new("TextButton", right)
+createBtn.Size = UDim2.new(0, 72, 0, 26)
+createBtn.Position = UDim2.new(1, -72, 0, 26)
+createBtn.Text = "Create"
+createBtn.Font = Enum.Font.SourceSansBold
+createBtn.TextSize = 14
+createBtn.BackgroundColor3 = Color3.fromRGB(52,152,219)
+createBtn.TextColor3 = Color3.fromRGB(255,255,255)
+createBtn.BorderSizePixel = 0
+createBtn.MouseButton1Click:Connect(function()
+    local name = tostring(nameInput.Text or ""):gsub("^%s+", ""):gsub("%s+$","")
+    if name == "" then
+        warn("[Macro] Enter a name")
+        return
+    end
+    if getgenv().Macros[name] then
+        warn("[Macro] Already exists")
+        return
+    end
+    saveMacro(name, {})
+    loadMacrosFromDisk()
+    refreshMacroList()
+    nameInput.Text = ""
+    print("[Macro] Created:", name)
+end)
+
+-- Record / Stop / Play / Save / StepDelay
+local recordBtn = Instance.new("TextButton", right)
+recordBtn.Size = UDim2.new(0, 120, 0, 36)
+recordBtn.Position = UDim2.new(0, 0, 0, 64)
+recordBtn.Text = "Record"
+recordBtn.Font = Enum.Font.SourceSansBold
+recordBtn.TextSize = 15
+recordBtn.BackgroundColor3 = Color3.fromRGB(231,76,60)
+recordBtn.TextColor3 = Color3.fromRGB(255,255,255)
+recordBtn.BorderSizePixel = 0
+
+local stopBtn = Instance.new("TextButton", right)
+stopBtn.Size = UDim2.new(0, 120, 0, 36)
+stopBtn.Position = UDim2.new(1, -120, 0, 64)
+stopBtn.Text = "Stop"
+stopBtn.Font = Enum.Font.SourceSansBold
+stopBtn.TextSize = 15
+stopBtn.BackgroundColor3 = Color3.fromRGB(127,140,141)
+stopBtn.TextColor3 = Color3.fromRGB(255,255,255)
+stopBtn.BorderSizePixel = 0
+
+local playBtn = Instance.new("TextButton", right)
+playBtn.Size = UDim2.new(0, 120, 0, 36)
+playBtn.Position = UDim2.new(0, 0, 0, 110)
+playBtn.Text = "Play"
+playBtn.Font = Enum.Font.SourceSansBold
+playBtn.TextSize = 15
+playBtn.BackgroundColor3 = Color3.fromRGB(46,204,113)
+playBtn.TextColor3 = Color3.fromRGB(255,255,255)
+playBtn.BorderSizePixel = 0
+
+local stopPlayBtn = Instance.new("TextButton", right)
+stopPlayBtn.Size = UDim2.new(0, 120, 0, 36)
+stopPlayBtn.Position = UDim2.new(1, -120, 0, 110)
+stopPlayBtn.Text = "Stop Play"
+stopPlayBtn.Font = Enum.Font.SourceSansBold
+stopPlayBtn.TextSize = 15
+stopPlayBtn.BackgroundColor3 = Color3.fromRGB(149,165,166)
+stopPlayBtn.TextColor3 = Color3.fromRGB(255,255,255)
+stopPlayBtn.BorderSizePixel = 0
+
+local stepDelayLabel = Instance.new("TextLabel", right)
+stepDelayLabel.Size = UDim2.new(0, 120, 0, 20)
+stepDelayLabel.Position = UDim2.new(0, 0, 0, 162)
+stepDelayLabel.BackgroundTransparency = 1
+stepDelayLabel.Text = "Step Delay (s):"
+stepDelayLabel.TextColor3 = Color3.fromRGB(220,220,220)
+stepDelayLabel.Font = Enum.Font.SourceSans
+stepDelayLabel.TextSize = 14
+stepDelayLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local stepDelayBox = Instance.new("TextBox", right)
+stepDelayBox.Size = UDim2.new(0, 120, 0, 26)
+stepDelayBox.Position = UDim2.new(0, 0, 0, 184)
+stepDelayBox.BackgroundColor3 = Color3.fromRGB(36,36,38)
+stepDelayBox.TextColor3 = Color3.fromRGB(220,220,220)
+stepDelayBox.PlaceholderText = tostring(getgenv().MacroStepDelay or 0.15)
+stepDelayBox.BorderSizePixel = 0
+stepDelayBox.Font = Enum.Font.SourceSans
+stepDelayBox.TextSize = 14
+
+local saveBtn = Instance.new("TextButton", right)
+saveBtn.Size = UDim2.new(0, 120, 0, 36)
+saveBtn.Position = UDim2.new(0, 0, 0, 224)
+saveBtn.Text = "Save Macro"
+saveBtn.Font = Enum.Font.SourceSansBold
+saveBtn.TextSize = 15
+saveBtn.BackgroundColor3 = Color3.fromRGB(52,152,219)
+saveBtn.TextColor3 = Color3.fromRGB(255,255,255)
+saveBtn.BorderSizePixel = 0
+
+local importBox = Instance.new("TextBox", right)
+importBox.Size = UDim2.new(1, -80, 0, 26)
+importBox.Position = UDim2.new(0, 0, 0, 268)
+importBox.BackgroundColor3 = Color3.fromRGB(36,36,38)
+importBox.TextColor3 = Color3.fromRGB(220,220,220)
+importBox.PlaceholderText = "Import URL (discord/raw)..."
+importBox.BorderSizePixel = 0
+importBox.Font = Enum.Font.SourceSans
+importBox.TextSize = 14
+
+local importBtn = Instance.new("TextButton", right)
+importBtn.Size = UDim2.new(0, 72, 0, 26)
+importBtn.Position = UDim2.new(1, -72, 0, 268)
+importBtn.Text = "Import"
+importBtn.Font = Enum.Font.SourceSansBold
+importBtn.TextSize = 14
+importBtn.BackgroundColor3 = Color3.fromRGB(52,152,219)
+importBtn.TextColor3 = Color3.fromRGB(255,255,255)
+importBtn.BorderSizePixel = 0
+
+-- Connect UI events
+recordBtn.MouseButton1Click:Connect(function()
+    if not getgenv().CurrentMacro then
+        warn("[Macro] Select or create a macro first")
+        return
+    end
+    startRecording()
+    print("[Macro] recording into:", getgenv().CurrentMacro)
+end)
+
+stopBtn.MouseButton1Click:Connect(function()
+    if getgenv().MacroRecording then
+        stopRecording(getgenv().CurrentMacro)
+        -- save automatically to current macro
+        saveMacro(getgenv().CurrentMacro, getgenv().MacroData)
+        loadMacrosFromDisk()
+        refreshMacroList()
+    end
+end)
+
+playBtn.MouseButton1Click:Connect(function()
+    local name = getgenv().CurrentMacro
+    if not name then warn("[Macro] Select macro to play") return end
+    local ok, msg = playMacro(name)
+    if not ok then warn("[Macro] play failed:", msg) end
+end)
+
+stopPlayBtn.MouseButton1Click:Connect(function()
+    stopPlayback()
+end)
+
+stepDelayBox.FocusLost:Connect(function(enter)
+    local txt = stepDelayBox.Text or ""
+    local n = tonumber(txt)
+    if n then
+        getgenv().MacroStepDelay = n
+        stepDelayBox.PlaceholderText = tostring(n)
+    else
+        stepDelayBox.Text = ""
+    end
+end)
+
+saveBtn.MouseButton1Click:Connect(function()
+    local name = getgenv().CurrentMacro
+    if not name then warn("[Macro] Select a macro") return end
+    local data = getgenv().MacroData or getgenv().Macros[name] or {}
+    local ok, err = saveMacro(name, data)
+    if ok then
+        print("[Macro] Saved:", name)
+        loadMacrosFromDisk()
+        refreshMacroList()
+    else
+        warn("[Macro] Save failed:", err)
+    end
+end)
+
+importBtn.MouseButton1Click:Connect(function()
+    local link = tostring(importBox.Text or ""):gsub("^%s+", ""):gsub("%s+$","")
+    if link == "" then warn("[Macro] Paste a url") return end
+    if not (link:match("cdn%.discord") or link:match("raw%.githubusercontent") or link:match("pastebin") or link:match("%.json")) then
+        warn("[Macro] URL not recognized; must be direct JSON link (cdn.discord/raw.github/pastebin)")
+        return
+    end
+    local ok, body = pcall(function() return game:HttpGet(link) end)
+    if not ok or not body then warn("[Macro] download failed") return end
+    local tbl = jsonDecode(body)
+    if not tbl or type(tbl) ~= "table" then warn("[Macro] invalid macro json") return end
+    local name = ("Imported_%s"):format(tostring(os.time()))
+    local ok2, err = saveMacro(name, tbl)
+    if ok2 then
+        loadMacrosFromDisk()
+        refreshMacroList()
+        print("[Macro] Imported as:", name)
+        importBox.Text = ""
+    else
+        warn("[Macro] Import save failed:", err)
+    end
+end)
+
+-- Auto select first macro when available
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if not getgenv().CurrentMacro then
+            for name in pairs(getgenv().Macros) do
+                getgenv().CurrentMacro = name
+                break
+            end
+        end
+        refreshMacroList()
+    end
+end)
+
+-- Cleanup on unload
+local function cleanup()
+    getgenv().MacroPlaybackActive = false
+    getgenv().MacroRecording = false
+    unwatchAllTowers()
+    pcall(function() gui:Destroy() end)
+    if namecallHooked and mt and oldNamecall then
+        setreadonly(mt, false)
+        mt.__namecall = oldNamecall
+        setreadonly(mt, true)
+    end
+    print("[Macro] Cleanup done")
+end
+
+-- bind cleanup to Unloading events if present
+if syn and syn.protect_gui then
+    -- nothing additional required
+end
+
+print("[Macro] Ready. UI created. Create a macro, then press Record.")
